@@ -37,3 +37,17 @@ export interface SearchResult {
   mode: string | null;
   messageCount: number;
 }
+
+export interface MessageSearchResult {
+  conversationId: string;
+  workspace: string;
+  workspacePath: string;
+  conversationTitle: string;
+  messageIndex: number;
+  role: string;
+  matchSnippet: string;
+  context: Array<{ index: number; role: string; snippet: string }>;
+  createdAt: number | null;
+  mode: string | null;
+  messageCount: number;
+}

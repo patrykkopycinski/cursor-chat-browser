@@ -8,7 +8,7 @@ import { loadComposerMetadata } from './composer-meta.js';
 import { SearchIndex } from './search-index.js';
 
 const SERVER_NAME = 'cursor-chat-browser';
-const SERVER_VERSION = '0.0.1';
+const SERVER_VERSION = '0.0.2';
 
 async function main() {
   const startTime = Date.now();
@@ -21,7 +21,6 @@ async function main() {
   const stats = index.stats();
   const elapsed = Date.now() - startTime;
 
-  // Enrich with composer metadata in the background (state.vscdb is large)
   if (transcripts.length > 0) {
     setImmediate(() => {
       try {
@@ -39,20 +38,94 @@ async function main() {
 
 Index: ${stats.totalConversations} conversations, ${stats.totalMessages} messages across ${stats.workspaceCount} workspaces (indexed ${indexed} new in ${elapsed}ms).
 
-Use search_conversations to find past discussions by keyword. Use get_conversation to retrieve full conversation content. Use list_workspaces to see all indexed workspaces.
+Use search_messages to find specific messages by keyword (returns the exact matching messages with surrounding context). Use search_conversations to find conversations by title. Use get_conversation to retrieve full conversation content, optionally filtered to matching messages.
 
 Proactively search past conversations when working on complex tasks — previous discussions may contain relevant decisions, patterns, or context.`,
     }
   );
 
   server.registerTool(
+    'search_messages',
+    {
+      title: 'Search Messages',
+      description:
+        'Search through individual messages across all past conversations. Returns the exact matching messages with surrounding context — much more precise than conversation-level search. Use this as the primary search tool to find specific discussions, fixes, decisions, or code changes.',
+      inputSchema: z.object({
+        query: z.string().describe('Search query — keywords, function names, error messages, concepts'),
+        workspace: z
+          .string()
+          .optional()
+          .describe('Filter to a specific workspace/project name (partial match)'),
+        limit: z
+          .number()
+          .optional()
+          .default(10)
+          .describe('Maximum number of matching messages to return (default: 10)'),
+        context_messages: z
+          .number()
+          .optional()
+          .default(2)
+          .describe('Number of surrounding messages to include for context (default: 2)'),
+      }),
+    },
+    async ({ query, workspace, limit, context_messages }) => {
+      const results = index.searchMessages(query, { workspace, limit, contextMessages: context_messages });
+
+      if (results.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `No messages found for query: "${query}"${workspace ? ` in workspace "${workspace}"` : ''}`,
+            },
+          ],
+        };
+      }
+
+      const lines = results.map((r, i) => {
+        const date = r.createdAt ? new Date(r.createdAt).toISOString().split('T')[0] : 'unknown';
+        const contextBefore = r.context
+          .filter((c) => c.index < r.messageIndex)
+          .map((c) => `  > [${c.role}] ${c.snippet}`)
+          .join('\n');
+        const contextAfter = r.context
+          .filter((c) => c.index > r.messageIndex)
+          .map((c) => `  > [${c.role}] ${c.snippet}`)
+          .join('\n');
+
+        return [
+          `### ${i + 1}. Match in "${r.conversationTitle}"`,
+          `- **Conversation:** ${r.conversationId}`,
+          `- **Workspace:** ${r.workspace} | **Date:** ${date} | **Message #${r.messageIndex}** (${r.role})`,
+          '',
+          contextBefore ? `${contextBefore}\n` : '',
+          `  **>>> [${r.role}] ${r.matchSnippet}**`,
+          '',
+          contextAfter || '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Found ${results.length} matching message(s) for "${query}":\n\n${lines.join('\n\n---\n\n')}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
     'search_conversations',
     {
-      title: 'Search Past Conversations',
+      title: 'Search Conversations by Title',
       description:
-        'Search through past Cursor AI conversations across all workspaces using full-text search. Returns matching conversations ranked by relevance. Use this to find previous discussions about a topic, decisions made, or implementations discussed.',
+        'Search conversations by title/topic. Returns conversation-level results. For finding specific messages or content within conversations, use search_messages instead.',
       inputSchema: z.object({
-        query: z.string().describe('Search query — keywords, function names, concepts, or phrases'),
+        query: z.string().describe('Search query — keywords or phrases to match against conversation titles'),
         workspace: z
           .string()
           .optional()
@@ -105,17 +178,21 @@ Proactively search past conversations when working on complex tasks — previous
     {
       title: 'Get Conversation',
       description:
-        'Retrieve the full content of a specific past conversation by its ID. Use after search_conversations to read the full discussion.',
+        'Retrieve a conversation by ID. Optionally search within it to get only matching messages instead of the full transcript.',
       inputSchema: z.object({
-        id: z.string().describe('Conversation UUID (from search_conversations results)'),
-        max_length: z
+        id: z.string().describe('Conversation UUID (from search results)'),
+        search: z
+          .string()
+          .optional()
+          .describe('Optional search query to filter to matching messages within this conversation. When provided, returns only relevant messages with context instead of the full transcript.'),
+        max_messages: z
           .number()
           .optional()
-          .default(10000)
-          .describe('Maximum character length of returned text (default: 10000). Truncates from the end.'),
+          .default(50)
+          .describe('Maximum number of messages to return (default: 50). Applies to both full retrieval and search-filtered results.'),
       }),
     },
-    async ({ id, max_length }) => {
+    async ({ id, search, max_messages }) => {
       const conv = index.getConversation(id);
 
       if (!conv) {
@@ -123,22 +200,70 @@ Proactively search past conversations when working on complex tasks — previous
       }
 
       const date = conv.createdAt ? new Date(conv.createdAt).toISOString() : 'unknown';
-      let text = conv.fullText;
-      let truncated = false;
-      if (text.length > max_length) {
-        text = text.slice(0, max_length);
-        truncated = true;
-      }
-
       const header = [
         `# ${conv.title}`,
         `**Workspace:** ${conv.workspace} (${conv.workspacePath})`,
         `**Date:** ${date} | **Mode:** ${conv.mode ?? 'unknown'} | **Branch:** ${conv.branch ?? 'unknown'} | **Messages:** ${conv.messageCount}`,
-        truncated ? `\n> Truncated to ${max_length} chars. Increase max_length to see more.\n` : '',
         '---',
       ].join('\n');
 
-      return { content: [{ type: 'text', text: `${header}\n\n${text}` }] };
+      if (search?.trim()) {
+        const matches = index.searchInConversation(id, search, { limit: max_messages, contextMessages: 2 });
+
+        if (matches.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `${header}\n\nNo messages matching "${search}" found in this conversation.`,
+              },
+            ],
+          };
+        }
+
+        const matchLines = matches.map((m) => {
+          const contextBefore = m.context
+            .filter((c) => c.index < m.index)
+            .map((c) => `  > [msg #${c.index} - ${c.role}] ${c.snippet}`)
+            .join('\n');
+          const contextAfter = m.context
+            .filter((c) => c.index > m.index)
+            .map((c) => `  > [msg #${c.index} - ${c.role}] ${c.snippet}`)
+            .join('\n');
+
+          return [
+            contextBefore || '',
+            `  **>>> [msg #${m.index} - ${m.role}] ${m.matchSnippet}**`,
+            contextAfter || '',
+          ]
+            .filter(Boolean)
+            .join('\n');
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${header}\n\nFound ${matches.length} message(s) matching "${search}":\n\n${matchLines.join('\n\n---\n\n')}`,
+            },
+          ],
+        };
+      }
+
+      // Full conversation retrieval
+      const messages = conv.messages.slice(0, max_messages);
+      const truncated = conv.messages.length > max_messages;
+
+      const messageLines = messages.map(
+        (m) => `[msg #${m.index} - ${m.role}]\n${m.text}`
+      );
+
+      const body = messageLines.join('\n\n');
+      const truncNote = truncated
+        ? `\n> Showing ${max_messages} of ${conv.messages.length} messages. Increase max_messages to see more.\n`
+        : '';
+
+      return { content: [{ type: 'text', text: `${header}${truncNote}\n\n${body}` }] };
     }
   );
 
@@ -147,7 +272,7 @@ Proactively search past conversations when working on complex tasks — previous
     {
       title: 'List Workspaces',
       description:
-        'List all workspaces that have indexed conversations, with conversation counts. Useful for discovering which projects have past discussions.',
+        'List all workspaces that have indexed conversations, with conversation counts.',
       inputSchema: z.object({}),
     },
     async () => {
@@ -179,7 +304,7 @@ Proactively search past conversations when working on complex tasks — previous
     {
       title: 'Recent Conversations',
       description:
-        'Get the most recent conversations, optionally filtered by workspace. Useful for getting quick context on recent work.',
+        'Get the most recent conversations, optionally filtered by workspace.',
       inputSchema: z.object({
         workspace: z
           .string()
@@ -229,7 +354,7 @@ Proactively search past conversations when working on complex tasks — previous
     {
       title: 'Reindex Conversations',
       description:
-        'Re-scan all workspaces and index any new conversations that appeared since the server started.',
+        'Re-scan all workspaces and index any new conversations. Also rebuilds the message-level search index.',
       inputSchema: z.object({}),
     },
     async () => {
