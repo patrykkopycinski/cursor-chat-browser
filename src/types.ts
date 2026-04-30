@@ -1,3 +1,5 @@
+export type ConversationSource = 'cursor' | 'claude';
+
 export interface Conversation {
   id: string;
   workspace: string;
@@ -9,6 +11,7 @@ export interface Conversation {
   mode: string | null;
   branch: string | null;
   messageCount: number;
+  source: ConversationSource;
 }
 
 export interface Message {
@@ -36,6 +39,7 @@ export interface SearchResult {
   createdAt: number | null;
   mode: string | null;
   messageCount: number;
+  source: ConversationSource;
 }
 
 export interface MessageSearchResult {
@@ -50,4 +54,5 @@ export interface MessageSearchResult {
   createdAt: number | null;
   mode: string | null;
   messageCount: number;
+  source: ConversationSource;
 }

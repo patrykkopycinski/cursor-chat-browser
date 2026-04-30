@@ -139,6 +139,7 @@ export function loadAllTranscripts(skipIds?: Set<string>): Conversation[] {
         mode: null,
         branch: null,
         messageCount: messages.length,
+        source: 'cursor',
       });
     }
   }

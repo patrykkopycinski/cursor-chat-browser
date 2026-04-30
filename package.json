@@ -1,7 +1,7 @@
 {
   "name": "cursor-chat-browser",
   "version": "0.0.2",
-  "description": "MCP server that indexes and searches past Cursor conversations across all workspaces",
+  "description": "MCP server that indexes and searches past Cursor AI and Claude Code conversations across all workspaces",
   "license": "Elastic-2.0",
   "author": "Patryk Kopycinski",
   "repository": {
