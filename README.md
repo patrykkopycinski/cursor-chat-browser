@@ -1,14 +1,17 @@
 # cursor-chat-browser
 
-MCP server that indexes and searches your past Cursor AI conversations across all workspaces.
+> **Deprecated.** This package is no longer the actively maintained version. Development continues in [`patryks-treadmill-claude-plugins`](https://github.com/patrykkopycinski/patryks-treadmill-claude-plugins) under `plugins/ai-conversation-intelligence/` (npm name `ai-chat-browser`), which has the same goals plus first-class subagent vs interactive classification, separate source adapters (`src/sources/cursor.ts`, `src/sources/claude.ts`), greedy filesystem-backed workspace path resolution, and richer per-source metadata extraction. Prefer that one for new installs.
+
+MCP server that indexes and searches your past Cursor AI and Claude Code conversations across all workspaces.
 
 Works with any MCP client — [Cursor](https://cursor.com), [Claude Desktop](https://claude.ai/download), [Windsurf](https://codeium.com/windsurf), and others.
 
 ## What it does
 
-- Scans `~/.cursor/projects/*/agent-transcripts/` for conversation history
+- Scans `~/.cursor/projects/*/agent-transcripts/` for Cursor conversation history
+- Scans `~/.claude/projects/*/*.jsonl` for Claude Code interactive sessions (subagent transcripts are filtered out)
 - Builds a persistent full-text search index (SQLite FTS4 via sql.js — zero native dependencies)
-- Enriches conversations with metadata (timestamps, mode, branch) from Cursor's internal database
+- Enriches Cursor conversations with metadata (timestamps, mode, branch) from Cursor's internal database
 - Exposes 5 MCP tools for searching, browsing, and retrieving past conversations
 
 ## Quick start
@@ -87,20 +90,21 @@ Re-scan for new conversations added since the server started.
 
 ## How it works
 
-1. On startup, scans `~/.cursor/projects/*/agent-transcripts/` for JSONL transcript files
-2. Parses each file into structured conversations (user messages, assistant responses)
+1. On startup, scans `~/.cursor/projects/*/agent-transcripts/` and `~/.claude/projects/*/*.jsonl` for transcript files
+2. Parses each file into structured conversations (user messages, assistant responses); skips Claude Code subagent transcripts (`agent-<hash>.jsonl`)
 3. Indexes into a persistent SQLite FTS4 database at `~/.cursor/chat-browser/search-index.db`
-4. Optionally enriches with metadata from Cursor's `state.vscdb` (timestamps, mode, branch) using the system `sqlite3` CLI
+4. Optionally enriches Cursor conversations with metadata from `state.vscdb` (timestamps, mode, branch) using the system `sqlite3` CLI
 5. Serves MCP tools over stdio transport
 
-Only new conversations are parsed on subsequent runs — the index is persistent.
+Only new conversations are parsed on subsequent runs — the index is persistent. Claude conversation IDs are prefixed with `claude:` so the source is visible in every result.
 
 ## Data sources
 
 | Source | What it provides | Required |
 |--------|-----------------|----------|
-| `~/.cursor/projects/*/agent-transcripts/` | Full conversation content | Yes |
-| `state.vscdb` (via `sqlite3` CLI) | Timestamps, mode, branch metadata | Optional |
+| `~/.cursor/projects/*/agent-transcripts/` | Full Cursor conversation content | Yes |
+| `~/.claude/projects/*/*.jsonl` | Claude Code interactive sessions (subagents filtered) | No |
+| `state.vscdb` (via `sqlite3` CLI) | Timestamps, mode, branch metadata for Cursor sessions | Optional |
 
 ## Platform support
 
@@ -113,7 +117,7 @@ Only new conversations are parsed on subsequent runs — the index is persistent
 ## Requirements
 
 - Node.js >= 20
-- Cursor IDE (for conversation data)
+- Cursor IDE and/or Claude Code (for conversation data)
 
 ## License
 

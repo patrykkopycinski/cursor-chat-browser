@@ -4,30 +4,11 @@ import { homedir } from 'node:os';
 import type { Conversation, Message } from './types.js';
 import { stripContextTags } from './utils.js';
 
-const CLAUDE_DIR = join(homedir(), '.claude');
-const CLAUDE_PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
-const CLAUDE_HISTORY_PATH = join(CLAUDE_DIR, 'history.jsonl');
+const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 
-function loadHistoryTitles(): Map<string, string> {
-  const titles = new Map<string, string>();
-  if (!existsSync(CLAUDE_HISTORY_PATH)) return titles;
-
-  try {
-    const content = readFileSync(CLAUDE_HISTORY_PATH, 'utf-8');
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line) as { display?: string; sessionId?: string };
-        // First entry for each sessionId = first user prompt = best title
-        if (entry.sessionId && entry.display && !titles.has(entry.sessionId)) {
-          titles.set(entry.sessionId, entry.display);
-        }
-      } catch { /* skip */ }
-    }
-  } catch { /* skip */ }
-
-  return titles;
-}
+// Subagent transcripts (spawned by the Task tool) live alongside interactive
+// sessions but are not user conversations. Filename pattern: agent-<hex>.jsonl
+const SUBAGENT_FILE_PATTERN = /^agent-[a-f0-9]+\.jsonl$/;
 
 interface ParsedTranscript {
   messages: Message[];
@@ -51,28 +32,31 @@ function parseClaudeTranscriptFile(filePath: string): ParsedTranscript {
       try {
         const entry = JSON.parse(line) as {
           type?: string;
-          message?: { content?: Array<{ type: string; text?: string }> };
+          message?: { content?: Array<{ type: string; text?: string }> | string };
           timestamp?: string;
           cwd?: string;
           sessionId?: string;
           gitBranch?: string;
         };
 
-        if (entry.type !== 'user' && entry.type !== 'assistant') continue;
-
-        if (entry.type === 'user') {
-          if (!cwd && entry.cwd) cwd = entry.cwd;
-          if (!sessionId && entry.sessionId) sessionId = entry.sessionId;
-          if (!branch && entry.gitBranch) branch = entry.gitBranch;
-          if (!createdAt && entry.timestamp) {
-            const ts = new Date(entry.timestamp).getTime();
-            if (!isNaN(ts)) createdAt = ts;
-          }
+        // Metadata can appear on any entry type (system, summary, user, assistant).
+        // Sessions resumed with --continue may have an assistant entry first.
+        if (!cwd && entry.cwd) cwd = entry.cwd;
+        if (!sessionId && entry.sessionId) sessionId = entry.sessionId;
+        if (!branch && entry.gitBranch) branch = entry.gitBranch;
+        if (!createdAt && entry.timestamp) {
+          const ts = new Date(entry.timestamp).getTime();
+          if (!isNaN(ts)) createdAt = ts;
         }
 
+        if (entry.type !== 'user' && entry.type !== 'assistant') continue;
+
         let text = '';
-        if (entry.message?.content) {
-          for (const block of entry.message.content) {
+        const messageContent = entry.message?.content;
+        if (typeof messageContent === 'string') {
+          text = messageContent;
+        } else if (Array.isArray(messageContent)) {
+          for (const block of messageContent) {
             if (block.type === 'text' && block.text) {
               text += block.text + '\n';
             }
@@ -89,23 +73,64 @@ function parseClaudeTranscriptFile(filePath: string): ParsedTranscript {
   return { messages, cwd, sessionId, createdAt, branch };
 }
 
-function extractTitle(messages: Message[], historyTitle: string | undefined): string {
-  const raw = historyTitle ?? stripContextTags(messages.find((m) => m.role === 'user')?.text ?? '');
+function extractTitle(messages: Message[]): string {
+  const firstUser = messages.find((m) => m.role === 'user');
+  const raw = stripContextTags(firstUser?.text ?? '');
   const title = raw.replace(/\s+/g, ' ').trim();
   if (!title) return '(no title)';
   return title.length > 120 ? title.slice(0, 117) + '...' : title;
 }
 
-function workspaceNameFromPath(cwd: string): string {
+// Claude encodes workspace paths as `-Users-foo-Projects-some-repo`. Dashes
+// inside real path segments (e.g. `agent-builder-server`) are indistinguishable
+// from path separators, so we greedy-match against the filesystem to recover
+// the actual path.
+function resolveClaudeWorkspaceKey(key: string): { name: string; path: string } {
+  const segments = key.replace(/^-/, '').split('-');
+  const resolvedParts: string[] = [];
+  let i = 0;
+
+  while (i < segments.length) {
+    let matched = false;
+    for (let j = segments.length; j > i; j--) {
+      const candidate = segments.slice(i, j).join('-');
+      const testPath = '/' + [...resolvedParts, candidate].join('/');
+      if (existsSync(testPath)) {
+        resolvedParts.push(candidate);
+        i = j;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      resolvedParts.push(segments[i]!);
+      i++;
+    }
+  }
+
+  const resolvedPath = '/' + resolvedParts.join('/');
+  const projectsIdx = resolvedParts.indexOf('Projects');
+  const name =
+    projectsIdx >= 0 && projectsIdx + 1 < resolvedParts.length
+      ? resolvedParts.slice(projectsIdx + 1).join('/')
+      : resolvedParts[resolvedParts.length - 1] ?? key;
+
+  return { name, path: resolvedPath };
+}
+
+function workspaceFromCwd(cwd: string): { name: string; path: string } {
   const parts = cwd.replace(/\\/g, '/').split('/').filter(Boolean);
-  return parts[parts.length - 1] ?? cwd;
+  const projectsIdx = parts.indexOf('Projects');
+  const name =
+    projectsIdx >= 0 && projectsIdx + 1 < parts.length
+      ? parts.slice(projectsIdx + 1).join('/')
+      : parts[parts.length - 1] ?? cwd;
+  return { name, path: cwd };
 }
 
 export function loadClaudeTranscripts(skipIds?: Set<string>): Conversation[] {
   const conversations: Conversation[] = [];
   if (!existsSync(CLAUDE_PROJECTS_DIR)) return conversations;
-
-  const historyTitles = loadHistoryTitles();
 
   for (const projectDir of readdirSync(CLAUDE_PROJECTS_DIR, { withFileTypes: true })) {
     if (!projectDir.isDirectory()) continue;
@@ -115,26 +140,33 @@ export function loadClaudeTranscripts(skipIds?: Set<string>): Conversation[] {
     for (const entry of readdirSync(projectPath, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
 
-      // Claude names the file after the session id, so filename stem === sessionId in practice.
+      // Skip subagent transcripts -- they pollute search results with
+      // sub-task chatter that was never part of a human conversation.
+      if (SUBAGENT_FILE_PATTERN.test(entry.name)) continue;
+
+      // Claude names the file after the session id, so filename stem === sessionId.
       const fileSessionId = entry.name.replace(/\.jsonl$/, '');
       const id = `claude:${fileSessionId}`;
       if (skipIds?.has(id)) continue;
 
       const jsonlPath = join(projectPath, entry.name);
-      const { messages, cwd, sessionId: parsedSessionId, createdAt, branch } =
-        parseClaudeTranscriptFile(jsonlPath);
+      const { messages, cwd, createdAt, branch } = parseClaudeTranscriptFile(jsonlPath);
 
       if (messages.length === 0) continue;
 
-      const workspacePath = cwd ?? '';
-      const workspace = workspacePath ? workspaceNameFromPath(workspacePath) : projectDir.name;
-      // Use unprefixed id for history.jsonl lookup (it stores bare session ids).
-      const actualSessionId = parsedSessionId ?? fileSessionId;
-      const title = extractTitle(messages, historyTitles.get(actualSessionId));
+      // Prefer the cwd recorded in the transcript; fall back to greedy
+      // resolution of the encoded directory name when missing.
+      const { name: workspace, path: workspacePath } = cwd
+        ? workspaceFromCwd(cwd)
+        : resolveClaudeWorkspaceKey(projectDir.name);
+
+      const title = extractTitle(messages);
 
       let fileCreatedAt = createdAt;
       if (!fileCreatedAt) {
-        try { fileCreatedAt = statSync(jsonlPath).mtimeMs; } catch { /* ignore */ }
+        // birthtimeMs reflects when the conversation started, not its last
+        // append -- which matches what the "Date" column means everywhere else.
+        try { fileCreatedAt = statSync(jsonlPath).birthtimeMs; } catch { /* ignore */ }
       }
 
       conversations.push({
