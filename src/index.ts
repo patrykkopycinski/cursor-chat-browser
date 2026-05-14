@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { loadAllTranscripts } from './transcripts.js';
+import { loadClaudeTranscripts } from './claude-transcripts.js';
 import { loadComposerMetadata } from './composer-meta.js';
 import { SearchIndex } from './search-index.js';
 
@@ -16,8 +17,9 @@ async function main() {
   const index = await SearchIndex.create();
   const existingIds = index.getIndexedIds();
   const transcripts = loadAllTranscripts(existingIds);
+  const claudeTranscripts = loadClaudeTranscripts(existingIds);
 
-  const indexed = index.indexConversations(transcripts);
+  const indexed = index.indexConversations([...transcripts, ...claudeTranscripts]);
   const stats = index.stats();
   const elapsed = Date.now() - startTime;
 
@@ -34,7 +36,7 @@ async function main() {
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
       capabilities: { tools: {} },
-      instructions: `Cursor Chat Browser — search and retrieve past Cursor AI conversations across all workspaces.
+      instructions: `Cursor Chat Browser — search and retrieve past Cursor AI and Claude Code conversations across all workspaces.
 
 Index: ${stats.totalConversations} conversations, ${stats.totalMessages} messages across ${stats.workspaceCount} workspaces (indexed ${indexed} new in ${elapsed}ms).
 
@@ -96,7 +98,7 @@ Proactively search past conversations when working on complex tasks — previous
         return [
           `### ${i + 1}. Match in "${r.conversationTitle}"`,
           `- **Conversation:** ${r.conversationId}`,
-          `- **Workspace:** ${r.workspace} | **Date:** ${date} | **Message #${r.messageIndex}** (${r.role})`,
+          `- **Workspace:** ${r.workspace} | **Source:** ${r.source} | **Date:** ${date} | **Message #${r.messageIndex}** (${r.role})`,
           '',
           contextBefore ? `${contextBefore}\n` : '',
           `  **>>> [${r.role}] ${r.matchSnippet}**`,
@@ -156,7 +158,7 @@ Proactively search past conversations when working on complex tasks — previous
         return [
           `### ${r.rank}. ${r.title}`,
           `- **ID:** ${r.id}`,
-          `- **Workspace:** ${r.workspace}`,
+          `- **Workspace:** ${r.workspace} | **Source:** ${r.source}`,
           `- **Date:** ${date} | **Mode:** ${r.mode ?? 'unknown'} | **Messages:** ${r.messageCount}`,
           `- **Preview:** ${r.snippet}`,
         ].join('\n');
@@ -180,7 +182,7 @@ Proactively search past conversations when working on complex tasks — previous
       description:
         'Retrieve a conversation by ID. Optionally search within it to get only matching messages instead of the full transcript.',
       inputSchema: z.object({
-        id: z.string().describe('Conversation UUID (from search results)'),
+        id: z.string().describe('Conversation ID from search results. Cursor IDs are UUIDs; Claude IDs are prefixed with "claude:".'),
         search: z
           .string()
           .optional()
@@ -203,7 +205,7 @@ Proactively search past conversations when working on complex tasks — previous
       const header = [
         `# ${conv.title}`,
         `**Workspace:** ${conv.workspace} (${conv.workspacePath})`,
-        `**Date:** ${date} | **Mode:** ${conv.mode ?? 'unknown'} | **Branch:** ${conv.branch ?? 'unknown'} | **Messages:** ${conv.messageCount}`,
+        `**Source:** ${conv.source} | **Date:** ${date} | **Mode:** ${conv.mode ?? 'unknown'} | **Branch:** ${conv.branch ?? 'unknown'} | **Messages:** ${conv.messageCount}`,
         '---',
       ].join('\n');
 
@@ -335,7 +337,7 @@ Proactively search past conversations when working on complex tasks — previous
 
       const lines = results.map((r) => {
         const date = r.createdAt ? new Date(r.createdAt).toISOString().split('T')[0] : 'unknown';
-        return `- **[${date}]** ${r.title} — ${r.workspace} (${r.messageCount} msgs) [ID: ${r.id}]`;
+        return `- **[${date}]** [${r.source}] ${r.title} — ${r.workspace} (${r.messageCount} msgs) [ID: ${r.id}]`;
       });
 
       return {
@@ -358,7 +360,11 @@ Proactively search past conversations when working on complex tasks — previous
       inputSchema: z.object({}),
     },
     async () => {
-      const fresh = loadAllTranscripts(index.getIndexedIds());
+      const existingIds = index.getIndexedIds();
+      const fresh = [
+        ...loadAllTranscripts(existingIds),
+        ...loadClaudeTranscripts(existingIds),
+      ];
       const meta = loadComposerMetadata();
 
       for (const conv of fresh) {

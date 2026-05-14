@@ -2,11 +2,12 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import initSqlJs, { type Database as SqlJsDatabase } from 'sql.js';
-import type { Conversation, ConversationMeta, SearchResult, MessageSearchResult } from './types.js';
+import type { Conversation, ConversationMeta, ConversationSource, SearchResult, MessageSearchResult } from './types.js';
+import { stripContextTags } from './utils.js';
 
 const INDEX_DIR = join(homedir(), '.cursor', 'chat-browser');
 const INDEX_DB_PATH = join(INDEX_DIR, 'search-index.db');
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 
 export class SearchIndex {
   private db: SqlJsDatabase;
@@ -84,7 +85,8 @@ export class SearchIndex {
         mode TEXT,
         branch TEXT,
         message_count INTEGER NOT NULL,
-        indexed_at INTEGER NOT NULL
+        indexed_at INTEGER NOT NULL,
+        source TEXT NOT NULL DEFAULT 'cursor'
       )
     `);
 
@@ -156,8 +158,8 @@ export class SearchIndex {
       for (const c of toInsert) {
         this.db.run(
           `INSERT OR REPLACE INTO conversations
-            (id, workspace, workspace_path, title, first_message, created_at, mode, branch, message_count, indexed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, workspace, workspace_path, title, first_message, created_at, mode, branch, message_count, indexed_at, source)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             c.id,
             c.workspace,
@@ -169,6 +171,7 @@ export class SearchIndex {
             c.branch,
             c.messageCount,
             Date.now(),
+            c.source,
           ]
         );
         this.db.run(
@@ -178,7 +181,7 @@ export class SearchIndex {
 
         for (let i = 0; i < c.messages.length; i++) {
           const msg = c.messages[i]!;
-          const cleanText = stripCursorWrapperTags(msg.text);
+          const cleanText = stripContextTags(msg.text);
           if (!cleanText.trim()) continue;
 
           this.db.run(
@@ -212,7 +215,7 @@ export class SearchIndex {
     if (!queryStr.trim()) return [];
 
     const ftsQuery = queryStr
-      .replace(/['"]/g, '')
+      .replace(/[-'"]/g, ' ')
       .split(/\s+/)
       .filter(Boolean)
       .join(' ');
@@ -223,7 +226,7 @@ export class SearchIndex {
     if (options?.workspace) {
       sql = `
         SELECT m.rowid, m.conv_id, m.msg_index, m.role, m.text,
-               c.workspace, c.workspace_path, c.title, c.created_at, c.mode, c.message_count
+               c.workspace, c.workspace_path, c.title, c.created_at, c.mode, c.message_count, c.source
         FROM messages_fts fts
         JOIN messages m ON m.rowid = fts.rowid
         JOIN conversations c ON c.id = m.conv_id
@@ -236,7 +239,7 @@ export class SearchIndex {
     } else {
       sql = `
         SELECT m.rowid, m.conv_id, m.msg_index, m.role, m.text,
-               c.workspace, c.workspace_path, c.title, c.created_at, c.mode, c.message_count
+               c.workspace, c.workspace_path, c.title, c.created_at, c.mode, c.message_count, c.source
         FROM messages_fts fts
         JOIN messages m ON m.rowid = fts.rowid
         JOIN conversations c ON c.id = m.conv_id
@@ -259,6 +262,7 @@ export class SearchIndex {
       created_at: number | null;
       mode: string | null;
       message_count: number;
+      source: string;
     };
 
     const rows = this.query<RawRow>(sql, params);
@@ -277,6 +281,7 @@ export class SearchIndex {
         createdAt: r.created_at,
         mode: r.mode,
         messageCount: r.message_count,
+        source: r.source as ConversationSource,
       };
     });
   }
@@ -311,14 +316,14 @@ export class SearchIndex {
 
     if (queryStr.trim()) {
       const ftsQuery = queryStr
-        .replace(/['"]/g, '')
+        .replace(/[-'"]/g, ' ')
         .split(/\s+/)
         .filter(Boolean)
         .join(' ');
 
       if (options?.workspace) {
         sql = `
-          SELECT c.id, c.workspace, c.workspace_path, c.title, c.first_message, c.message_count, c.created_at, c.mode
+          SELECT c.id, c.workspace, c.workspace_path, c.title, c.first_message, c.message_count, c.created_at, c.mode, c.source
           FROM conversations_fts fts
           JOIN conversations c ON c.id = fts.conv_id
           WHERE conversations_fts MATCH ?
@@ -328,7 +333,7 @@ export class SearchIndex {
         params.push(ftsQuery, `%${options.workspace}%`, limit);
       } else {
         sql = `
-          SELECT c.id, c.workspace, c.workspace_path, c.title, c.first_message, c.message_count, c.created_at, c.mode
+          SELECT c.id, c.workspace, c.workspace_path, c.title, c.first_message, c.message_count, c.created_at, c.mode, c.source
           FROM conversations_fts fts
           JOIN conversations c ON c.id = fts.conv_id
           WHERE conversations_fts MATCH ?
@@ -338,11 +343,11 @@ export class SearchIndex {
       }
     } else {
       if (options?.workspace) {
-        sql = `SELECT id, workspace, workspace_path, title, first_message, message_count, created_at, mode
+        sql = `SELECT id, workspace, workspace_path, title, first_message, message_count, created_at, mode, source
                FROM conversations WHERE workspace LIKE ? ORDER BY created_at DESC LIMIT ?`;
         params.push(`%${options.workspace}%`, limit);
       } else {
-        sql = `SELECT id, workspace, workspace_path, title, first_message, message_count, created_at, mode
+        sql = `SELECT id, workspace, workspace_path, title, first_message, message_count, created_at, mode, source
                FROM conversations ORDER BY created_at DESC LIMIT ?`;
         params.push(limit);
       }
@@ -357,6 +362,7 @@ export class SearchIndex {
       message_count: number;
       created_at: number | null;
       mode: string | null;
+      source: string;
     }>(sql, params);
 
     return rows.map((r, i) => ({
@@ -369,6 +375,7 @@ export class SearchIndex {
       createdAt: r.created_at,
       mode: r.mode,
       messageCount: r.message_count,
+      source: r.source as ConversationSource,
     }));
   }
 
@@ -382,6 +389,7 @@ export class SearchIndex {
     mode: string | null;
     branch: string | null;
     messageCount: number;
+    source: ConversationSource;
   } | null {
     const rows = this.query<{
       id: string;
@@ -392,8 +400,9 @@ export class SearchIndex {
       mode: string | null;
       branch: string | null;
       message_count: number;
+      source: string;
     }>(
-      `SELECT id, workspace, workspace_path, title, created_at, mode, branch, message_count
+      `SELECT id, workspace, workspace_path, title, created_at, mode, branch, message_count, source
        FROM conversations WHERE id = ?`,
       [id]
     );
@@ -416,6 +425,7 @@ export class SearchIndex {
       mode: row.mode,
       branch: row.branch,
       messageCount: row.message_count,
+      source: row.source as ConversationSource,
     };
   }
 
@@ -430,7 +440,7 @@ export class SearchIndex {
     if (!queryStr.trim()) return [];
 
     const ftsQuery = queryStr
-      .replace(/['"]/g, '')
+      .replace(/[-'"]/g, ' ')
       .split(/\s+/)
       .filter(Boolean)
       .join(' ');
@@ -509,14 +519,6 @@ export class SearchIndex {
     this.save();
     this.db.close();
   }
-}
-
-function stripCursorWrapperTags(text: string): string {
-  return text
-    .replace(/<(?:system_reminder|user_info|git_status|open_and_recently_viewed_files|rules|agent_skills|agent_transcripts|attached_files|external_links|image_files|terminal_files_information)[^>]*>[\s\S]*?<\/[^>]+>/g, '')
-    .replace(/<\/?user_query>/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
 }
 
 function truncateToSnippet(text: string, maxLen: number): string {
